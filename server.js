@@ -1,121 +1,139 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const sqlite3 = require('sqlite3').verbose();
+const http = require('http');
+const { Server } = require('socket.io');
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = 'super_secret_goodcord_key'; // Use env var in production
 
 app.use(cors());
 app.use(express.json());
 
-const usersPath = path.join(__dirname, 'users.json');
-
-// Load users from JSON file
-function loadUsers() {
-  try {
-    const data = fs.readFileSync(usersPath, 'utf-8');
-    return JSON.parse(data);
-  } catch (err) {
-    console.error('Failed to read users.json:', err);
-    return [];
-  }
-}
-
-// Save users to JSON file
-function saveUsers(users) {
-  fs.writeFileSync(usersPath, JSON.stringify(users, null, 2));
-}
-
-// GET /users - list all usernames
-app.get('/users', (req, res) => {
-  const users = loadUsers();
-  const usernames = users.map(u => u.username);
-  res.json(usernames);
+// Initialize SQLite database
+const db = new sqlite3.Database('./goodcord.db', (err) => {
+  if (err) console.error('DB error:', err);
+  else console.log('SQLite DB connected');
 });
 
-// POST /friend-request - validate friend request usernames
+// Create tables if not exist
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE,
+    email TEXT UNIQUE,
+    password TEXT
+  )`);
+  
+  db.run(`CREATE TABLE IF NOT EXISTS friends (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    requester TEXT,
+    requested TEXT,
+    status TEXT DEFAULT 'pending'
+  )`);
+});
+
+// ====== SOCKET.IO ======
+io.on('connection', (socket) => {
+  console.log('User connected');
+
+  socket.on('disconnect', () => {
+    console.log('User disconnected');
+  });
+});
+
+// ====== ROUTES ======
+
+// List all usernames
+app.get('/users', (req, res) => {
+  db.all(`SELECT username FROM users`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    const usernames = rows.map(r => r.username);
+    res.json(usernames);
+  });
+});
+
+// Friend request
 app.post('/friend-request', (req, res) => {
   const { from, to } = req.body;
+  if (!from || !to) return res.status(400).json({ success: false, message: 'Missing from or to' });
+  if (from.toLowerCase() === to.toLowerCase()) return res.status(400).json({ success: false, message: 'Cannot add yourself' });
 
-  if (!from || !to) {
-    return res.status(400).json({ success: false, message: 'Missing from or to username' });
-  }
+  // Check if 'to' exists
+  db.get(`SELECT username FROM users WHERE username = ?`, [to], (err, row) => {
+    if (err) return res.status(500).json({ success: false, message: 'DB error' });
+    if (!row) return res.status(400).json({ success: false, message: `User "${to}" does not exist.` });
 
-  if (from.toLowerCase() === to.toLowerCase()) {
-    return res.status(400).json({ success: false, message: 'You cannot add yourself as a friend.' });
-  }
-
-  const users = loadUsers();
-  const userExists = users.some(u => u.username.toLowerCase() === to.toLowerCase());
-
-  if (!userExists) {
-    return res.status(400).json({ success: false, message: `User "${to}" does not exist.` });
-  }
-
-  // TODO: Add friend logic here (persist friend list, notifications, etc.)
-
-  res.json({ success: true, message: `Friend request sent to ${to}.` });
+    // Insert friend request
+    db.run(`INSERT INTO friends (requester, requested) VALUES (?, ?)`, [from, to], function(err) {
+      if (err) return res.status(500).json({ success: false, message: 'DB error' });
+      
+      // Notify via Socket.IO
+      io.emit('friend_request', { from, to });
+      res.json({ success: true, message: `Friend request sent to ${to}.` });
+    });
+  });
 });
 
-// POST /signup - register a new user
+// Signup
 app.post('/signup', async (req, res) => {
   const { username, email, password } = req.body;
-  if (!username || !email || !password) {
-    return res.status(400).json({ success: false, message: 'Missing fields' });
-  }
+  if (!username || !email || !password) return res.status(400).json({ success: false, message: 'Missing fields' });
 
-  let users = loadUsers();
+  db.get(`SELECT * FROM users WHERE email = ? OR username = ?`, [email, username], async (err, row) => {
+    if (err) return res.status(500).json({ success: false, message: 'DB error' });
+    if (row) {
+      if (row.email === email) return res.status(400).json({ success: false, message: 'Email already registered' });
+      if (row.username === username) return res.status(400).json({ success: false, message: 'Username already taken' });
+    }
 
-  if (users.find(u => u.email.toLowerCase() === email.toLowerCase())) {
-    return res.status(400).json({ success: false, message: 'Email already registered' });
-  }
-
-  if (users.find(u => u.username.toLowerCase() === username.toLowerCase())) {
-    return res.status(400).json({ success: false, message: 'Username already taken' });
-  }
-
-  try {
-    const hashedPassword = await bcrypt.hash(password, 10);
-    users.push({ username, email, password: hashedPassword });
-    saveUsers(users);
-    res.json({ success: true, message: 'User registered' });
-  } catch (err) {
-    console.error('Signup error:', err);
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
+    try {
+      const hashedPassword = await bcrypt.hash(password, 10);
+      db.run(`INSERT INTO users (username, email, password) VALUES (?, ?, ?)`, [username, email, hashedPassword], function(err) {
+        if (err) return res.status(500).json({ success: false, message: 'DB error' });
+        res.json({ success: true, message: 'User registered' });
+      });
+    } catch (err) {
+      console.error('Signup error:', err);
+      res.status(500).json({ success: false, message: 'Server error' });
+    }
+  });
 });
 
-// POST /login - authenticate user and issue token
-app.post('/login', async (req, res) => {
+// Login
+app.post('/login', (req, res) => {
   const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ success: false, message: 'Missing fields' });
-  }
+  if (!email || !password) return res.status(400).json({ success: false, message: 'Missing fields' });
 
-  const users = loadUsers();
-  const user = users.find(u => u.email.toLowerCase() === email.toLowerCase());
-  if (!user) {
-    return res.status(401).json({ success: false, message: 'Invalid credentials' });
-  }
+  db.get(`SELECT * FROM users WHERE email = ?`, [email], async (err, user) => {
+    if (err) return res.status(500).json({ success: false, message: 'DB error' });
+    if (!user) return res.status(401).json({ success: false, message: 'Invalid credentials' });
 
-  try {
     const match = await bcrypt.compare(password, user.password);
-    if (!match) {
-      return res.status(401).json({ success: false, message: 'Invalid credentials' });
-    }
+    if (!match) return res.status(401).json({ success: false, message: 'Invalid credentials' });
+
     const token = jwt.sign({ email: user.email, username: user.username }, JWT_SECRET, { expiresIn: '1h' });
     res.json({ success: true, token, username: user.username });
-  } catch (err) {
-    console.error('Login error:', err);
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
+  });
+});
+
+// Announcements (staff only)
+app.post('/announcement', (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ success: false, message: 'Message required' });
+
+  // Emit to all clients
+  io.emit('global_announcement', message);
+  res.json({ success: true, message: 'Announcement sent' });
 });
 
 // Start server
-app.listen(PORT, () => {
-  console.log(`Backend server running on port ${PORT}`);
+server.listen(PORT, () => {
+  console.log(`GoodCord backend running on port ${PORT}`);
 });
