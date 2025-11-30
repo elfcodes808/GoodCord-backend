@@ -10,7 +10,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000; // updated to match your running backend
 const JWT_SECRET = 'super_secret_goodcord_key'; // Use env var in production
 
 app.use(cors());
@@ -35,7 +35,8 @@ db.serialize(() => {
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     requester TEXT,
     requested TEXT,
-    status TEXT DEFAULT 'pending'
+    status TEXT DEFAULT 'pending',
+    UNIQUE(requester, requested)
   )`);
 });
 
@@ -65,18 +66,24 @@ app.post('/friend-request', (req, res) => {
   if (!from || !to) return res.status(400).json({ success: false, message: 'Missing from or to' });
   if (from.toLowerCase() === to.toLowerCase()) return res.status(400).json({ success: false, message: 'Cannot add yourself' });
 
-  // Check if 'to' exists
-  db.get(`SELECT username FROM users WHERE username = ?`, [to], (err, row) => {
+  // Check if 'to' exists (case-insensitive)
+  db.get(`SELECT username FROM users WHERE LOWER(username) = LOWER(?)`, [to], (err, row) => {
     if (err) return res.status(500).json({ success: false, message: 'DB error' });
     if (!row) return res.status(400).json({ success: false, message: `User "${to}" does not exist.` });
 
-    // Insert friend request
-    db.run(`INSERT INTO friends (requester, requested) VALUES (?, ?)`, [from, to], function(err) {
+    // Check for duplicate friend request
+    db.get(`SELECT * FROM friends WHERE LOWER(requester) = LOWER(?) AND LOWER(requested) = LOWER(?)`, [from, to], (err, exists) => {
       if (err) return res.status(500).json({ success: false, message: 'DB error' });
-      
-      // Notify via Socket.IO
-      io.emit('friend_request', { from, to });
-      res.json({ success: true, message: `Friend request sent to ${to}.` });
+      if (exists) return res.status(400).json({ success: false, message: 'Friend request already sent' });
+
+      // Insert friend request
+      db.run(`INSERT INTO friends (requester, requested) VALUES (?, ?)`, [from, to], function(err) {
+        if (err) return res.status(500).json({ success: false, message: 'DB error' });
+        
+        // Notify via Socket.IO
+        io.emit('friend_request', { from, to });
+        res.json({ success: true, message: `Friend request sent to ${to}.` });
+      });
     });
   });
 });
@@ -140,7 +147,6 @@ app.post('/reset-password', async (req, res) => {
     res.status(500).json({ success: false, message: 'Server error' });
   }
 });
-
 
 // Announcements (staff only)
 app.post('/announcement', (req, res) => {
