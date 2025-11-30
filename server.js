@@ -123,6 +123,25 @@ app.post('/login', (req, res) => {
   });
 });
 
+// ====== PASSWORD RESET ======
+app.post('/reset-password', async (req, res) => {
+  const { email, newPassword } = req.body;
+  if (!email || !newPassword) return res.status(400).json({ success: false, message: 'Missing fields' });
+
+  try {
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    db.run(`UPDATE users SET password = ? WHERE email = ?`, [hashedPassword, email], function(err) {
+      if (err) return res.status(500).json({ success: false, message: 'DB error' });
+      if (this.changes === 0) return res.status(404).json({ success: false, message: 'User not found' });
+      res.json({ success: true, message: 'Password reset successfully' });
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+
 // Announcements (staff only)
 app.post('/announcement', (req, res) => {
   const { message } = req.body;
